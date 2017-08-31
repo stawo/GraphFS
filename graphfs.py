@@ -4,7 +4,7 @@ import os
 import sys
 import errno
 from errno import ENOENT
-from stat import S_IFDIR, S_IFLNK, S_IFREG
+import stat  # S_IFDIR, S_IFLNK, S_IFREG
 from time import time
 
 from fuse import FUSE, FuseOSError, Operations
@@ -66,6 +66,50 @@ class GraphFSNeo4j(Passthrough):
                 else:
                     raise ValueError("There was an error parsing path [{}].".format(path))
 
+    def __isGroup(self, groupId):
+        if not Group.select(self.graph, groupId).first() is None:
+            return True
+
+        return False
+
+    def __isFile(self, fileId):
+        if not File.select(self.graph, fileId).first() is None:
+            return True
+
+        return False
+    
+    def __verifyPath(self, path, lastElementMustExist = False):
+        """
+        A path is valid if all the elements apart the last one are existing groups.
+        If lastElementMustExist is True, then the last element must be either a Group or a File
+        """
+        elementsIDs = self.__parsePathInGroups(path)
+
+        if elementsIDs is None:
+            return True
+        elif lastElementMustExist:
+            if len(elementsIDs) > 1:
+                if all(self.__isGroup(element) for element in elementsIDs[:-1]) \
+                    and (self.__isGroup(elementsIDs[-1]) \
+                        or self.__isFile(elementsIDs[-1])):
+                    return True
+                else:
+                    return False
+            else:
+                if self.__isGroup(elementsIDs[-1]) \
+                    or self.__isFile(elementsIDs[-1]):
+                    return True
+                else:
+                    return False
+        else:    
+            if len(elementsIDs) > 1:
+                if all(self.__isGroup(element) for element in elementsIDs[:-1]):
+                    return True
+                else:
+                    return False
+            else:
+                return True
+        
     # Filesystem methods
     # ==================
 
@@ -96,14 +140,31 @@ class GraphFSNeo4j(Passthrough):
         print("getattr: {}".format(path))
 
         
+        # Check if the last element refers to a group or a file
+        if path == "/":
+            return dict(
+                st_mode=(stat.S_IFDIR | 0o755)
+                , st_nlink=1
+                , st_size=1024
+                , st_ctime=time()
+                , st_mtime=time()
+                , st_atime=time()
+                , st_uid = os.getuid()
+                , st_gid = os.getgid()
+            )
+
+        if not self.__verifyPath(path, lastElementMustExist=True):
+            raise FuseOSError(errno.ENOENT)
+            
         # Split the path in single elements.
         # Each element is a group, apart the last one, which could be a file.
         # First we normalize the path (so we have all '/' as delimiters),
         # then we remove the eventual drive letter, as we don't need it.
         groupIDs = self.__parsePathInGroups(path)
-        if groupIDs is None:
+        
+        if self.__isGroup(groupIDs[-1]):
             return dict(
-                st_mode=(S_IFDIR | 0o755)
+                st_mode=(stat.S_IFDIR | 0o755)
                 , st_nlink=2
                 , st_size=1024
                 , st_ctime=time()
@@ -113,22 +174,21 @@ class GraphFSNeo4j(Passthrough):
                 , st_gid = os.getgid()
             )
         
-        # Check if the last element refers to a group or a file
-        if Group.select(self.graph, groupIDs[-1]).first() is None and \
-            File.select(self.graph, groupIDs[-1]).first() is None:
-            raise FuseOSError(errno.ENOENT)
-
-        return dict(
-            st_mode=(S_IFDIR | 0o755)
-            , st_nlink=1
-            , st_size=1024
-            , st_ctime=time()
-            , st_mtime=time()
-            , st_atime=time()
-            , st_uid = os.getuid()
-            , st_gid = os.getgid()
-        )
+        if self.__isFile(groupIDs[-1]):
+            return dict(
+                st_mode=(stat.S_IFREG | 0o755)
+                , st_nlink=1
+                , st_size=1024
+                , st_ctime=time()
+                , st_mtime=time()
+                , st_atime=time()
+                , st_uid = os.getuid()
+                , st_gid = os.getgid()
+            )
         
+        # The path does not refer to a group nor a file
+        raise FuseOSError(errno.ENOENT)
+
     def readdir(self, path, fh=None):
         
         # How to manage the fact that a file can have the same name as a group?
@@ -138,19 +198,22 @@ class GraphFSNeo4j(Passthrough):
 
         dirents = ['.', '..']
         
+        if not self.__verifyPath(path, lastElementMustExist=True):
+            raise OSError("The path [{}] is invalid".format(path))
+
         # Split the path in single elements.
         # Each element is a group, apart the last one, which could be a file.
         # First we normalize the path (so we have all '/' as delimiters),
         # then we remove the eventual drive letter, as we don't need it.
         groupIDs = self.__parsePathInGroups(path)
 
+        # Retrieve all the groups
         if groupIDs is None:
             query = "MATCH (g:Group) RETURN g.name as name"
         else:
             # Retrieve files that are connected to all the groups
             # We achieve that by checking which files belong to the groups specified in the path
             # and see if they belong to additional groups as well
-            # If groupIDs is empty, then we return all possible groups
             query = """WITH {groupIDs} as groups
                 MATCH (g:Group)<-[:isInGroup]-(f:File)-[:isInGroup]->(gNew:Group)
                 WHERE g.name in groups
@@ -163,10 +226,25 @@ class GraphFSNeo4j(Passthrough):
         
         queryResults = self.graph.run(query)
         
-        # for queryResult in queryResults:
-        #     print (queryResult)
-
-        # dirents.extend([os.path.join(*groupIDs, queryResult["name"]) for queryResult in queryResults])
+        dirents.extend([queryResult["name"] for queryResult in queryResults])
+        
+        # Retrieve all the files
+        if groupIDs is None:
+            query = "MATCH (f:File) RETURN f.name as name"
+        else:
+            # Retrieve files that are connected to all the groups
+            # We achieve that by checking which files belong to the groups specified in the path
+            query = """WITH {groupIDs} as groups
+                MATCH (g:Group)<-[:isInGroup]-(f:File)
+                WHERE g.name in groups
+                WITH f, size(groups) as inputCnt, count(DISTINCT g) as cnt
+                WHERE cnt = inputCnt
+                RETURN f.name as name""".format(groupIDs = list(groupIDs))
+        
+        print("query: {}".format(query))
+        
+        queryResults = self.graph.run(query)
+        
         dirents.extend([queryResult["name"] for queryResult in queryResults])
         
         print("dirents: {}".format(dirents))
@@ -192,6 +270,9 @@ class GraphFSNeo4j(Passthrough):
         print("-------")
         print("rmdir {}".format(path))
         
+        if not self.__verifyPath(path, lastElementMustExist=True):
+            raise OSError("The path [{}] is invalid".format(path))
+
         # Split the path in single elements.
         # Each element is a group, apart the last one, which could be a file.
         # First we normalize the path (so we have all '/' as delimiters),
@@ -202,7 +283,7 @@ class GraphFSNeo4j(Passthrough):
             raise OSError("Cannot remove root.")
         
         # Check if the last element exists already as a group
-        if Group.select(self.graph, groupIDs[-1]).first() is None:
+        if not self.__isGroup(groupIDs[-1]):
             # It already exists
             raise OSError("The group {} does not exists".format(groupIDs[-1]))
         
@@ -221,6 +302,9 @@ class GraphFSNeo4j(Passthrough):
         print("-------")
         print("mkdir {}".format(path))
 
+        if not self.__verifyPath(path):
+            raise OSError("The path [{}] is invalid".format(path))
+
         # Split the path in single elements.
         # Each element is a group, apart the last one, which could be a file.
         # First we normalize the path (so we have all '/' as delimiters),
@@ -231,9 +315,14 @@ class GraphFSNeo4j(Passthrough):
             raise OSError("Cannot create root.")
         
         # Check if the last element exists already as a group
-        if not Group.select(self.graph, groupIDs[-1]).first() is None:
+        if self.__isGroup(groupIDs[-1]):
             # It already exists
             raise FileExistsError("The group {} already exists".format(groupIDs[-1]))
+        
+        # Check if the last element exists already as a file
+        if self.__isFile(groupIDs[-1]):
+            # It already exists
+            raise FileExistsError("The file {} already exists".format(groupIDs[-1]))
         
         print("Create group {}".format(groupIDs[-1]))
 
@@ -257,7 +346,11 @@ class GraphFSNeo4j(Passthrough):
         pass
         
     def rename(self, old, new):
-        
+        """
+        Rename the file, directory, or other object "from" to the target "to".
+        Note that the source and target don't have to be in the same directory,
+        so it may be necessary to move the source to an entirely new directory.
+        """
         print("-------")
         print("rename")
         print("old: " + old)
@@ -268,38 +361,146 @@ class GraphFSNeo4j(Passthrough):
         if not isinstance(new, str):
             raise TypeError("The new name must be a string.")
         
+        if not self.__verifyPath(old, lastElementMustExist=True):
+            raise OSError("The path [{}] is invalid".format(old))
+        if not self.__verifyPath(new):
+            raise OSError("The path [{}] is invalid".format(new))
+
+        
         oldGroupIDs = self.__parsePathInGroups(old)
-        
-        if groupIDs is None:
-            raise OSError("Cannot rename root.")
-        
-        # We consider only the last element of oldGroupIDs, as it is the one we want
-        # to rename
-        old = oldGroupIDs[-1]
-
         newGroupIDs = self.__parsePathInGroups(new)    
+        
+        if oldGroupIDs is None:
+            raise OSError("Cannot rename/move root.")
+        
         if newGroupIDs is None:
-            raise OSError("Cannot rename a folder as root.")
+            # All groups and files are already in the root group,
+            # so we do not have to do anything.
+            return
+            
+        # Check if the last element newGroupIDs 
+        # is the same of oldGroupIDs. In yes, it means we
+        # are trying to move the old element
+        if oldGroupIDs[-1] == newGroupIDs[-1]:
+            
+            # Remove the last element, the remaining ones are for sure valid groups
+            newGroupIDs = newGroupIDs[:-1] 
+
+            # We have to move old into new
+            
+            # Check if last element of old is a group
+            if self.__isGroup(oldGroupIDs[-1]):
+                raise OSError("Cannot move folder into a folder.")
+            
+            elif self.__isFile(oldGroupIDs[-1]):
+                # We have to:
+                # - remove file oldGroupIDs[-1] from all the groups in oldGroupIDs[:-1]
+                # - add file oldGroupIDs[-1] to all the groups newGroupIDs
+                
+                for groupId in oldGroupIDs[:-1]:
+                    query = "MATCH (f:File)-[r:isInGroup]->(g:Group) WHERE f.name = '{fileId}' AND g.name = '{groupId}' DELETE r".format(
+                        fileId = oldGroupIDs[-1]
+                        , groupId = groupId
+                        )
+                    
+                    queryResults = self.graph.run(query)
+                
+                for groupId in newGroupIDs:
+                    query = "MATCH (f:File),(g:Group) WHERE f.name = '{fileId}' AND g.name = '{groupId}' CREATE (f)-[r:isInGroup]->(g) RETURN r".format(
+                        fileId = oldGroupIDs[-1]
+                        , groupId = groupId
+                        )
+                    
+                    queryResults = self.graph.run(query)
+            
+            else:
+                # We shouldn't be here
+                raise Exception('Something went wrong.')
+            
+        else:
+            
+            # Check if last element of old is a group
+            if self.__isGroup(oldGroupIDs[-1]):
+
+                if self.__isFile(newGroupIDs[-1]):
+                    raise FileExistsError("The file {} already exists".format(newGroupIDs[-1]))
+
+                elif self.__isGroup(newGroupIDs[-1]):
+                    # We have to move group oldGroupIDs[-1] into all the groups newGroupIDs
+                    raise OSError("Cannot move folder into a folder.")                    
+                    
+                else:
+                    # We have to:
+                    # - rename group oldGroupIDs[-1] into newGroupIDs[-1],
+                    # - move group oldGroupIDs[-1] into all the groups newGroupIDs[:-1]
+                    query = """MATCH (g:Group {{ name: '{oldGroupId}' }})
+                        SET g.name = '{newGroupId}'
+                        RETURN g""".format(
+                            oldGroupId = oldGroupIDs[-1]
+                            , newGroupId = newGroupIDs[-1])
+
+                    queryResults = self.graph.run(query)
+            
+            elif self.__isFile(oldGroupIDs[-1]):
+                
+                if self.__isFile(newGroupIDs[-1]):
+                    raise FileExistsError("The file {} already exists".format(newGroupIDs[-1]))
+
+                elif self.__isGroup(newGroupIDs[-1]):
+                    # We have to:
+                    # - remove file oldGroupIDs[-1] from all the groups in oldGroupIDs[:-1]
+                    # - add file oldGroupIDs[-1] to all the groups newGroupIDs
+                    
+                    for groupId in oldGroupIDs[:-1]:
+                        query = "MATCH (f:File)-[r:isInGroup]->(g:Group) WHERE f.name = '{fileId}' AND g.name = '{groupId}' DELETE r".format(
+                            fileId = oldGroupIDs[-1]
+                            , groupId = groupId
+                            )
+                        
+                        queryResults = self.graph.run(query)
+                    
+                    for groupId in newGroupIDs:
+                        query = "MATCH (f:File),(g:Group) WHERE f.name = '{fileId}' AND g.name = '{groupId}' CREATE (f)-[r:isInGroup]->(g) RETURN r".format(
+                            fileId = oldGroupIDs[-1]
+                            , groupId = groupId
+                            )
+                        
+                        queryResults = self.graph.run(query)
+
+                else:
+                    # We have to:
+                    # - rename file oldGroupIDs[-1] into newGroupIDs[-1],
+                    # - remove file oldGroupIDs[-1] from all the groups in oldGroupIDs[:-1]
+                    # - add file oldGroupIDs[-1] to all the groups newGroupIDs
+                    query = """MATCH (f:File {{ name: '{oldFileId}' }})
+                        SET f.name = '{newFileId}'
+                        RETURN f""".format(
+                            oldFileId = oldGroupIDs[-1]
+                            , newFileId = newGroupIDs[-1])
+
+                    queryResults = self.graph.run(query)
+
+                    # We remove file oldGroupIDs[-1] from groups oldGroupIDs[:-1]
+                    for groupId in oldGroupIDs[:-1]:
+                        query = "MATCH (f:File)-[r:isInGroup]->(g:Group) WHERE f.name = '{fileId}' AND g.name = '{groupId}' DELETE r".format(
+                            fileId = oldGroupIDs[-1]
+                            , groupId = groupId
+                            )
+                        
+                        queryResults = self.graph.run(query)
+                    
+                    # We have to move file old into folders new
+                    for groupId in newGroupIDs:
+                        query = "MATCH (f:File),(g:Group) WHERE f.name = '{fileId}' AND g.name = '{groupId}' CREATE (f)-[r:isInGroup]->(g) RETURN r".format(
+                            fileId = oldGroupIDs[-1]
+                            , groupId = groupId
+                            )
+                        
+                        queryResults = self.graph.run(query)
+            else:
+                # We shouldn't be here
+                raise Exception('Something went wrong.')
         
-        # We consider only the last element of newGroupIDs, as it is the one we want
-        # to use as a name
-        new = newGroupIDs[-1]
-
-        # Check if old exists as a group
-        if Group.select(self.graph, old).first() is None:
-            # It already exists
-            raise FileExistsError("The group {} doesn't exists".format(new))
-
-        # Check if new exists already as a group
-        if not Group.select(self.graph, new).first() is None:
-            # It already exists
-            raise FileExistsError("The group {} already exists".format(new))
-
-        query = """MATCH (g:Group {{ name: '{groupId}' }})
-        SET g.name = '{newGroupId}'
-        RETURN g""".format(groupId = old, newGroupId = new)
-        
-        queryResults = self.graph.run(query)
 
     def link(self, target, name):
         # return os.link(self._full_path(name), self._full_path(target))
@@ -313,42 +514,153 @@ class GraphFSNeo4j(Passthrough):
     # ============
 
     def open(self, path, flags):
-        # full_path = self._full_path(path)
-        # return os.open(full_path, flags)
-        raise Exception("Operation not supported")
         
+        print("-------")
+        print("open {}".format(path))
+
+        # Split the path in single elements.
+        # Each element is a group, apart the last one, which is the file name.
+        # First we normalize the path (so we have all '/' as delimiters),
+        # then we remove the eventual drive letter, as we don't need it.
+        groupIDs = self.__parsePathInGroups(path)
+
+        if groupIDs is None:
+            raise OSError("Must specify a proper file name.")
+        
+        # Check if the last element exists already as a file
+        if self.__isFile(groupIDs[-1]):
+            # It already exists
+            raise FileExistsError("The file {} already exists".format(groupIDs[-1]))
+        
+        return True
+
     def create(self, path, mode, fi=None):
-        # full_path = self._full_path(path)
-        # return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
-        raise Exception("Operation not supported")
+        
+        print("-------")
+        print("create {}".format(path))
+
+        # Split the path in single elements.
+        # Each element is a group, apart the last one, which is the file name.
+        # First we normalize the path (so we have all '/' as delimiters),
+        # then we remove the eventual drive letter, as we don't need it.
+        groupIDs = self.__parsePathInGroups(path)
+
+        if groupIDs is None:
+            raise OSError("Must specify a proper file name.")
+        
+        # Check if the last element exists already as a file
+        if self.__isFile(groupIDs[-1]):
+            # It already exists
+            raise FileExistsError("The file {} already exists".format(groupIDs[-1]))
+        
+        # Check if the last element exists already as a group
+        if self.__isGroup(groupIDs[-1]):
+            # It already exists
+            raise FileExistsError("The group {} already exists".format(groupIDs[-1]))
+        
+        print("Create file {}".format(groupIDs[-1]))
+
+        query = "CREATE (f:File{{name:'{fileId}'}})".format(fileId = groupIDs[-1])
+        queryResults = self.graph.run(query)
+        
+        # Link the file to all the groups appearing in groupIDs
+        if len(groupIDs) > 1:
+            for groupId in groupIDs[:-1]:
+                query = "MATCH (f:File),(g:Group) WHERE f.name = '{fileId}' AND g.name = '{groupId}' CREATE (f)-[r:isInGroup]->(g) RETURN r".format(
+                    fileId = groupIDs[-1]
+                    , groupId = groupId
+                    )
+                
+                queryResults = self.graph.run(query)
+
+        return 0
 
     def read(self, path, length, offset, fh):
-        # os.lseek(fh, offset, os.SEEK_SET)
-        # return os.read(fh, length)
-        raise Exception("Operation not supported")
+        
+        print("-------")
+        print("read {}".format(path))
+
+        # Split the path in single elements.
+        # Each element is a group, apart the last one, which is the file name.
+        # First we normalize the path (so we have all '/' as delimiters),
+        # then we remove the eventual drive letter, as we don't need it.
+        groupIDs = self.__parsePathInGroups(path)
+
+        if groupIDs is None:
+            raise OSError("Must specify a proper file name.")
+        
+        # Check if the last element exists already as a file
+        if not self.__isFile(groupIDs[-1]):
+            # It already exists
+            raise FileExistsError("The file {} does not exists".format(groupIDs[-1]))
+        
+        query = "MATCH (f:File{{name:'{fileId}'}}) RETURN f.value".format(fileId = groupIDs[-1])
+        queryResults = self.graph.run(query)
+        
+        return queryResults
 
     def write(self, path, buf, offset, fh):
-        # os.lseek(fh, offset, os.SEEK_SET)
-        # return os.write(fh, buf)
-        raise Exception("Operation not supported")
+        
+        print("-------")
+        print("write {}".format(path))
+
+        # Split the path in single elements.
+        # Each element is a group, apart the last one, which is the file name.
+        # First we normalize the path (so we have all '/' as delimiters),
+        # then we remove the eventual drive letter, as we don't need it.
+        groupIDs = self.__parsePathInGroups(path)
+
+        if groupIDs is None:
+            raise OSError("Must specify a proper file name.")
+        
+        # Check if the last element exists already as a file
+        if not self.__isFile(groupIDs[-1]):
+            # It already exists
+            raise FileExistsError("The file {} does not exists".format(groupIDs[-1]))
+        
+        query = "MATCH (f:File{{name:'{fileId}'}}) SET f.value = '{value}' RETURN f".format(
+            fileId = groupIDs[-1]
+            , value = buf
+            )
+        queryResults = self.graph.run(query)
+        
+        return len(buf)
 
     def truncate(self, path, length, fh=None):
-        # full_path = self._full_path(path)
-        # with open(full_path, 'r+') as f:
-        #     f.truncate(length)
-        raise Exception("Operation not supported")
+        
+        print("-------")
+        print("write {}".format(path))
+
+        # Split the path in single elements.
+        # Each element is a group, apart the last one, which is the file name.
+        # First we normalize the path (so we have all '/' as delimiters),
+        # then we remove the eventual drive letter, as we don't need it.
+        groupIDs = self.__parsePathInGroups(path)
+
+        if groupIDs is None:
+            raise OSError("Must specify a proper file name.")
+        
+        # Check if the last element exists already as a file
+        if not self.__isFile(groupIDs[-1]):
+            # It already exists
+            raise FileExistsError("The file {} does not exists".format(groupIDs[-1]))
+        
+        query = "MATCH (f:File{{name:'{fileId}'}}) SET f.value = NULL RETURN f".format(
+            fileId = groupIDs[-1]
+            )
+        queryResults = self.graph.run(query)
 
     def flush(self, path, fh):
         # return os.fsync(fh)
-        raise Exception("Operation not supported")
+        pass
 
     def release(self, path, fh):
         # return os.close(fh)
-        raise Exception("Operation not supported")
+        pass
 
     def fsync(self, path, fdatasync, fh):
         # return self.flush(path, fh)
-        raise Exception("Operation not supported")
+        pass
 
 
 if __name__ == '__main__':
