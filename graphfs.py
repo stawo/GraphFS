@@ -3,7 +3,6 @@
 import os
 import sys
 import errno
-from errno import ENOENT
 import stat  # S_IFDIR, S_IFLNK, S_IFREG
 from time import time
 
@@ -27,7 +26,7 @@ RENAME_EXCHANGE = 1 # (1 << 1)	/* Exchange source and dest */
 RENAME_WHITEOUT = 2 # (1 << 2)	/* Whiteout source */
 
 # Various variables
-fileTime = time()
+
 
 # ---------------------------------------------------------
 
@@ -44,7 +43,7 @@ class File(GraphObject):
     name = Property()
 
     isInGroup = RelatedTo("Group", "isInGroup")
-   
+
 # ---------------------------------------------------------
 # Main class
 
@@ -54,6 +53,7 @@ class GraphFSNeo4j(Operations):
         
         self.graph = Graph(password="JAt2Y4pG$YvaIpVP")
         
+        self.fileTime = time()
         
     # Helpers
     # =======
@@ -180,9 +180,9 @@ class GraphFSNeo4j(Operations):
                 st_mode=(stat.S_IFDIR | 0o755)
                 , st_nlink=2
                 , st_size=1024
-                , st_ctime=fileTime
-                , st_mtime=fileTime
-                , st_atime=fileTime
+                , st_ctime=self.fileTime
+                , st_mtime=self.fileTime
+                , st_atime=self.fileTime
                 , st_uid = os.getuid()
                 , st_gid = os.getgid()
             )
@@ -198,9 +198,9 @@ class GraphFSNeo4j(Operations):
                 st_mode=(stat.S_IFDIR | 0o755)
                 , st_nlink=2
                 , st_size=1024
-                , st_ctime=fileTime
-                , st_mtime=fileTime
-                , st_atime=fileTime
+                , st_ctime=self.fileTime
+                , st_mtime=self.fileTime
+                , st_atime=self.fileTime
                 , st_uid = os.getuid()
                 , st_gid = os.getgid()
             )
@@ -221,9 +221,9 @@ class GraphFSNeo4j(Operations):
                 st_mode=(stat.S_IFREG | 0o755)
                 , st_nlink=1
                 , st_size= fileSize # Full size of the file
-                , st_ctime=fileTime
-                , st_mtime=fileTime
-                , st_atime=fileTime
+                , st_ctime=self.fileTime
+                , st_mtime=self.fileTime
+                , st_atime=self.fileTime
                 , st_uid = os.getuid()
                 , st_gid = os.getgid()
             )
@@ -859,5 +859,4 @@ class GraphFSNeo4j(Operations):
 
 if __name__ == '__main__':
     
-    FUSE(GraphFSNeo4j(), 'Prova', nothreads=True, foreground=True, debug=False)
-    
+    filesystem = FUSE(GraphFSNeo4j(), 'Prova', nothreads=True, foreground=True, debug=False)
