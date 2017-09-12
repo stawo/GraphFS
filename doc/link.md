@@ -5,10 +5,12 @@ Various links used to create this project:
 * https://www.cs.hmc.edu/~geoff/classes/hmc.cs135.201001/homework/fuse/fuse_doc.html#readdir-details
 * http://libfuse.github.io/doxygen/structfuse__operations.html
 * https://github.com/libfuse/libfuse/blob/master/include/fuse.h
+* https://github.com/libfuse/python-fuse/wiki
 * https://github.com/cjgiridhar/seFS
 * https://medium.com/the-python-corner/writing-a-fuse-filesystem-in-python-5e0f2de3a813
 * http://pubs.opengroup.org/onlinepubs/007908799/xsh/sysstat.h.html
 * https://www.cs.nmsu.edu/~pfeiffer/fuse-tutorial/
 * Errors: http://man7.org/linux/man-pages/man3/errno.3.html
 * Neo4j query with intersection: https://neo4j.com/developer/kb/performing-match-intersection/
-
+* https://github.com/yadayada/acd_cli/blob/master/acdcli/acd_fuse.py
+* http://ak-aureus.blogspot.dk/2013/07/writing-fuse-file-system-using-python.html
